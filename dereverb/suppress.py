@@ -32,6 +32,49 @@ _LOG_FLOOR = 1e-300
 _OLA_FLOOR = 1e-12
 
 
+def _periodic_hann(n_fft: int) -> list[float]:
+    return [0.5 - 0.5 * math.cos(2.0 * math.pi * n / n_fft) for n in range(n_fft)]
+
+
+def _check_stft_params(n_fft: int, hop: int) -> None:
+    if not isinstance(n_fft, int) or isinstance(n_fft, bool) or n_fft < 2 or n_fft % 2 != 0:
+        raise ValueError("n_fft must be a positive even integer")
+    if not isinstance(hop, int) or isinstance(hop, bool) or hop <= 0:
+        raise ValueError("hop must be a positive integer")
+
+
+def _check_rectangular(name: str, arr) -> tuple[int, int]:
+    if not isinstance(arr, list):
+        raise ValueError(f"{name} must be a list of rows")
+    rows = len(arr)
+    cols = None
+    for row in arr:
+        if not isinstance(row, list):
+            raise ValueError(f"{name} must be a list of rows")
+        if cols is None:
+            cols = len(row)
+        elif len(row) != cols:
+            raise ValueError(f"{name} must be rectangular")
+    return rows, (cols if cols is not None else 0)
+
+
+def _check_same_shape(mag, late) -> tuple[int, int]:
+    rows_a, cols_a = _check_rectangular("mag", mag)
+    rows_b, cols_b = _check_rectangular("late", late)
+    if rows_a != rows_b or cols_a != cols_b:
+        raise ValueError("shapes must match")
+    return rows_a, cols_a
+
+
+def _check_finite_nonnegative(name: str, arr) -> None:
+    for row in arr:
+        for value in row:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"{name} values must be real numbers")
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} values must be finite and non-negative")
+
+
 def stft_mag(samples: list[float], n_fft: int, hop: int) -> list[list[float]]:
     """Return the one-sided magnitude STFT of ``samples``.
 
@@ -64,7 +107,60 @@ def stft_mag(samples: list[float], n_fft: int, hop: int) -> list[list[float]]:
 
     Comparison against a reference implementation uses ``abs=1e-9``.
     """
-    raise NotImplementedError("stft_mag is not implemented yet")
+    _check_stft_params(n_fft, hop)
+    if not isinstance(samples, list) or len(samples) < n_fft:
+        raise ValueError("samples must be a list with len(samples) >= n_fft")
+    for value in samples:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            raise ValueError("samples must be finite real numbers")
+
+    window = _periodic_hann(n_fft)
+    bins = n_fft // 2 + 1
+    frames = 1 + (len(samples) - n_fft) // hop
+    out = []
+    for t in range(frames):
+        start = t * hop
+        row = []
+        for k in range(bins):
+            real = 0.0
+            imag = 0.0
+            for n in range(n_fft):
+                value = samples[start + n] * window[n]
+                angle = 2.0 * math.pi * k * n / n_fft
+                real += value * math.cos(angle)
+                imag -= value * math.sin(angle)
+            row.append(math.hypot(real, imag))
+        out.append(row)
+    return out
+
+
+def _stft_mag_phase(samples: list[float], n_fft: int, hop: int):
+    """Complex STFT shared by the batch pipeline (same conventions as stft_mag)."""
+    _check_stft_params(n_fft, hop)
+    if not isinstance(samples, list) or len(samples) < n_fft:
+        raise ValueError("samples must be a list with len(samples) >= n_fft")
+    window = _periodic_hann(n_fft)
+    bins = n_fft // 2 + 1
+    frames = 1 + (len(samples) - n_fft) // hop
+    mag = []
+    phase = []
+    for t in range(frames):
+        start = t * hop
+        mag_row = []
+        phase_row = []
+        for k in range(bins):
+            real = 0.0
+            imag = 0.0
+            for n in range(n_fft):
+                value = samples[start + n] * window[n]
+                angle = 2.0 * math.pi * k * n / n_fft
+                real += value * math.cos(angle)
+                imag -= value * math.sin(angle)
+            mag_row.append(math.hypot(real, imag))
+            phase_row.append(math.atan2(imag, real))
+        mag.append(mag_row)
+        phase.append(phase_row)
+    return mag, phase
 
 
 def decay_estimate(mag: list[list[float]], frame: int, k: int) -> list[float]:
@@ -89,7 +185,45 @@ def decay_estimate(mag: list[list[float]], frame: int, k: int) -> list[float]:
     current magnitude is non-positive, or the fit has zero time variance.
     Magnitudes are linear; comparisons use ``abs=1e-9``.
     """
-    raise NotImplementedError("decay_estimate is not implemented yet")
+    if not isinstance(mag, list) or len(mag) == 0:
+        return []
+    if not isinstance(frame, int) or frame < 0 or frame >= len(mag):
+        raise ValueError("frame must be a valid row index of mag")
+    bins = len(mag[frame])
+    if frame <= 0 or k <= 0:
+        return [0.0] * bins
+
+    start = max(0, frame - k)
+    count = frame - start + 1
+    if count < 2:
+        return [0.0] * bins
+
+    # Least-squares slope of ln(mag) over t = start .. frame, per bin.
+    t_mean = (start + frame) / 2.0
+    var_t = 0.0
+    for t in range(start, frame + 1):
+        var_t += (t - t_mean) ** 2
+    if var_t <= 0.0:
+        return [0.0] * bins
+
+    span = frame - start
+    late = []
+    for b in range(bins):
+        current = mag[frame][b]
+        if current <= 0.0:
+            late.append(0.0)
+            continue
+        y_mean = 0.0
+        for t in range(start, frame + 1):
+            y_mean += math.log(max(mag[t][b], _LOG_FLOOR))
+        y_mean /= count
+        cov = 0.0
+        for t in range(start, frame + 1):
+            cov += (t - t_mean) * (math.log(max(mag[t][b], _LOG_FLOOR)) - y_mean)
+        slope = cov / var_t
+        rate = max(0.0, -slope)
+        late.append(current * (1.0 - math.exp(-rate * span)))
+    return late
 
 
 def spectral_subtract(
@@ -111,7 +245,18 @@ def spectral_subtract(
     otherwise.  Returns a new list with the same shape; comparisons use
     ``abs=1e-9``.
     """
-    raise NotImplementedError("spectral_subtract is not implemented yet")
+    rows, cols = _check_same_shape(mag, late)
+    _check_finite_nonnegative("mag", mag)
+    _check_finite_nonnegative("late", late)
+    if not isinstance(over_sub, (int, float)) or isinstance(over_sub, bool):
+        raise ValueError("over_sub must be a real number")
+    if not math.isfinite(over_sub) or over_sub < 0:
+        raise ValueError("over_sub must be finite and >= 0")
+
+    return [
+        [max(mag[t][b] - over_sub * late[t][b], MAG_FLOOR) for b in range(cols)]
+        for t in range(rows)
+    ]
 
 
 def wiener_gain(
@@ -133,7 +278,24 @@ def wiener_gain(
     Returns a new array with the same shape.  Gain comparisons use
     ``abs=1e-9``.
     """
-    raise NotImplementedError("wiener_gain is not implemented yet")
+    rows, cols = _check_same_shape(mag, late)
+    _check_finite_nonnegative("mag", mag)
+    _check_finite_nonnegative("late", late)
+    if not isinstance(floor, (int, float)) or isinstance(floor, bool):
+        raise ValueError("floor must be a real number")
+    if not math.isfinite(floor) or floor < 0.0 or floor > 1.0:
+        raise ValueError("floor must lie in [0, 1]")
+
+    out = []
+    for t in range(rows):
+        row = []
+        for b in range(cols):
+            m2 = mag[t][b] ** 2
+            denominator = m2 + late[t][b] ** 2
+            gain = 1.0 if denominator <= 0.0 else m2 / denominator
+            row.append(min(1.0, max(floor, gain)))
+        out.append(row)
+    return out
 
 
 def smooth_gain(gain: list[list[float]], alpha: float) -> list[list[float]]:
@@ -154,7 +316,36 @@ def smooth_gain(gain: list[list[float]], alpha: float) -> list[list[float]]:
     frequency leaves frame-to-frame flicker.  Both axes are required.
     Comparisons use ``abs=1e-9``.
     """
-    raise NotImplementedError("smooth_gain is not implemented yet")
+    if not isinstance(alpha, (int, float)) or isinstance(alpha, bool) or not math.isfinite(alpha):
+        raise ValueError("alpha must be a finite real number")
+    alpha = min(1.0, max(0.0, alpha))
+
+    if not isinstance(gain, list):
+        raise ValueError("gain must be a list of rows")
+    rows = len(gain)
+    if rows == 0:
+        return []
+    cols = len(gain[0])
+
+    # Frequency smoothing with edge replication.
+    freq_smoothed = []
+    for row in gain:
+        if len(row) != cols:
+            raise ValueError("gain must be rectangular")
+        smoothed_row = []
+        for b in range(cols):
+            left = row[b - 1] if b - 1 >= 0 else row[0]
+            right = row[b + 1] if b + 1 < cols else row[cols - 1]
+            smoothed_row.append(0.25 * left + 0.5 * row[b] + 0.25 * right)
+        freq_smoothed.append(smoothed_row)
+
+    # Causal first-order time smoothing, then clamp to [0, 1].
+    out = [freq_smoothed[0]]
+    for t in range(1, rows):
+        prev = out[t - 1]
+        cur = freq_smoothed[t]
+        out.append([alpha * prev[b] + (1.0 - alpha) * cur[b] for b in range(cols)])
+    return [[min(1.0, max(0.0, value)) for value in row] for row in out]
 
 
 def reconstruct(
@@ -184,7 +375,50 @@ def reconstruct(
     mismatches, invalid FFT parameters, or non-finite values raise
     ``ValueError``.  Round-trip comparisons use ``abs=1e-9``.
     """
-    raise NotImplementedError("reconstruct is not implemented yet")
+    _check_stft_params(n_fft, hop)
+    rows, cols = _check_same_shape(mag, phase)
+    if rows == 0:
+        raise ValueError("mag and phase must contain at least one frame")
+    if cols != n_fft // 2 + 1:
+        raise ValueError("bin count must equal n_fft // 2 + 1")
+    for name, arr in (("mag", mag), ("phase", phase)):
+        for row in arr:
+            for value in row:
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(value)
+                ):
+                    raise ValueError(f"{name} values must be finite real numbers")
+
+    window = _periodic_hann(n_fft)
+    length = (rows - 1) * hop + n_fft
+    out = [0.0] * length
+    norm = [0.0] * length
+    half = n_fft // 2
+
+    for t in range(rows):
+        mag_row = mag[t]
+        phase_row = phase[t]
+        offset = t * hop
+        for n in range(n_fft):
+            # Inverse DFT of the Hermitian spectrum at time index n.
+            total = mag_row[0] * math.cos(phase_row[0])
+            for k in range(1, half):
+                angle = phase_row[k] + 2.0 * math.pi * k * n / n_fft
+                total += 2.0 * mag_row[k] * math.cos(angle)
+            total += mag_row[half] * math.cos(phase_row[half] + math.pi * n)
+            y = total / n_fft
+            w = window[n]
+            out[offset + n] += w * y
+            norm[offset + n] += w * w
+
+    for i in range(length):
+        if norm[i] <= _OLA_FLOOR:
+            out[i] = 0.0
+        else:
+            out[i] /= norm[i]
+    return out
 
 
 def validate(mag: list[list[float]], gain: list[list[float]]) -> list[str]:
@@ -208,7 +442,55 @@ def validate(mag: list[list[float]], gain: list[list[float]]) -> list[str]:
     arrays are empty in the same way; a zero-row array with a non-zero gain is
     a shape error.
     """
-    raise NotImplementedError("validate is not implemented yet")
+
+    def _shape(arr):
+        if not isinstance(arr, list):
+            return None
+        rows = len(arr)
+        cols = None
+        for row in arr:
+            if not isinstance(row, list):
+                return None
+            if cols is None:
+                cols = len(row)
+            elif len(row) != cols:
+                return None
+        return rows, (cols if cols is not None else 0)
+
+    shape_mag = _shape(mag)
+    shape_gain = _shape(gain)
+    if shape_mag is None or shape_gain is None or shape_mag != shape_gain:
+        return ["shape"]
+
+    for arr in (mag, gain):
+        for row in arr:
+            for value in row:
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    return ["nan"]
+                if not math.isfinite(value):
+                    return ["nan"]
+
+    issues = []
+    for arr in (mag, gain):
+        for row in arr:
+            for value in row:
+                if value < 0.0:
+                    issues.append("negative")
+                    break
+            if "negative" in issues:
+                break
+        if "negative" in issues:
+            break
+
+    for row in gain:
+        for value in row:
+            if value > 1.0 + TOL:
+                issues.append("gain>1")
+                break
+        if "gain>1" in issues:
+            break
+
+    return issues
 
 
 def dereverb_batch(tracks: list[dict], config: dict) -> dict[str, list[float]]:
@@ -240,4 +522,55 @@ def dereverb_batch(tracks: list[dict], config: dict) -> dict[str, list[float]]:
     invalid shapes raise ``ValueError``.  This function must not mutate its
     arguments.  Comparisons use ``abs=1e-12`` for batch-versus-solo equality.
     """
-    raise NotImplementedError("dereverb_batch is not implemented yet")
+    if not isinstance(config, dict):
+        raise ValueError("config must be a dict")
+    required = ("n_fft", "hop", "k", "over_sub", "floor", "alpha")
+    for key in required:
+        if key not in config:
+            raise ValueError(f"config is missing {key!r}")
+    n_fft = config["n_fft"]
+    hop = config["hop"]
+    k = config["k"]
+    over_sub = config["over_sub"]
+    floor = config["floor"]
+    alpha = config["alpha"]
+    _check_stft_params(n_fft, hop)
+    if not isinstance(k, int) or isinstance(k, bool):
+        raise ValueError("k must be an integer")
+
+    if not isinstance(tracks, list):
+        raise ValueError("tracks must be a list")
+
+    result: dict[str, list[float]] = {}
+    for track in tracks:
+        if not isinstance(track, dict):
+            raise ValueError("each track must be a dict")
+        name = track.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("each track needs a non-empty string name")
+        if name in result:
+            raise ValueError(f"duplicate track name {name!r}")
+        samples = track.get("samples")
+        if not isinstance(samples, list):
+            raise ValueError("each track needs a samples list")
+        for value in samples:
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+            ):
+                raise ValueError("samples must be finite real numbers")
+
+        # All per-track state is computed fresh inside this loop iteration.
+        mag, phase = _stft_mag_phase(samples, n_fft, hop)
+        late = [decay_estimate(mag, t, k) for t in range(len(mag))]
+        clean = spectral_subtract(mag, late, over_sub)
+        gain = wiener_gain(clean, late, floor)
+        smoothed = smooth_gain(gain, alpha)
+        enhanced = [
+            [clean[t][b] * smoothed[t][b] for b in range(len(clean[t]))]
+            for t in range(len(clean))
+        ]
+        result[name] = reconstruct(enhanced, phase, n_fft, hop)
+
+    return result
